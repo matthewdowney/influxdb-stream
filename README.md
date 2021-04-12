@@ -1,0 +1,34 @@
+# influxdb-stream
+
+InfluxDB has some memory usage issues which make it difficult to 
+[read](https://community.influxdata.com/t/export-big-data-from-influxdb/2204/3) 
+or [write](https://github.com/influxdata/influxdb/issues/15433) large amounts of 
+data at once. 
+
+This repository contains helpers to split these operations up into "streams" of 
+finely chunked operations which don't cause InfluxDB to self-descruct.
+
+## Usage
+
+```clojure 
+(pull-data
+  {;; The InfluxDB database to connect to
+   :host  "127.0.0.1"
+   :port  8086
+   :db    "marketdata"
+
+
+   ;; Fetch all rows for this measurement, between the start and end dates,
+   ;; making queries spanning :interval amounts of time. The :interval is
+   ;; important because it imposes a bound on InfluxDB memory usage for a
+   ;; single query.
+   :measurement "trade"
+   :start #inst"2020-01-01"
+   :interval [24 :hours]
+   :end #inst"2020-02-01"
+
+   ;; Write a certain number of rows per file to a series of files named with
+   ;; the given pattern, which accepts the timestamp of the first row.
+   :file "trade.%s.csv"
+   :rows-per-file 10000})
+```
