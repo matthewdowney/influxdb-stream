@@ -172,8 +172,6 @@
       path)))
 
 
-;; TODO: Do this in its own thread, allow reading ahead one whole file worth of
-;;       rows before blocking to await the previous write
 (defn write-to-disk [{:keys [file date-format]} columns rows]
   (let [columns (all-columns columns rows)
         get-cell (fn [col]
@@ -186,7 +184,9 @@
         get-row (apply juxt (map get-cell columns))
         path (unique-path file date-format (-> rows first (get "time")))]
     (io/make-parents path)
+
     (timbre/debugf "writing %s rows to %s" (count rows) path)
+
     (with-open [w (io/writer path)]
       ;; CSV headers
       (.write w (string/join "," columns))
@@ -196,24 +196,33 @@
       (doseq [r rows]
         (.write w (string/join "," (get-row r)))
         (.write w "\n")))
-    (timbre/debug "write complete")))
+
+    (timbre/debugf "wrote %s rows to %s" (count rows) path)))
 
 
 (defn- fetch-and-write [conf]
   (timbre/info "fetching column headers and first data chunk...")
   (let [{:keys [columns stream]} (stream-data conf)]
-    (loop [stream stream]
+    (loop [stream stream
+           last-write-future nil]
       (if-let [nxt (first stream)]
         ;; If there's an error, it's the value which terminates the stream.
         (let [?err (-> nxt peek ::error)
               rows-to-write (if ?err (butlast nxt) nxt)]
 
-          (write-to-disk conf columns rows-to-write)
+          ;; If the previous write is still in progress, wait for it to finish
+          (when last-write-future
+            (when-not (realized? last-write-future)
+              (timbre/debug "awaiting previous write completion...")
+              @last-write-future))
 
           (when ?err
             (throw (ex-info "query failed" (dissoc (peek nxt) ::error) ?err)))
 
-          (recur (rest stream)))
+          (recur
+            (rest stream)
+            ;; Start this write in a new thread
+            (future (write-to-disk conf columns rows-to-write))))
 
         (timbre/info "reached end of data stream")))))
 
