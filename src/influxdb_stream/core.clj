@@ -1,13 +1,14 @@
 (ns influxdb-stream.core
   (:require [clojure.string :as string]
             [clojure.set :as set]
+            [clojure.pprint :as pprint]
+            [clojure.instant :as inst]
             [clojure.java.io :as io]
             [clojure.data.json :as json]
 
             [clj-http.client :as client]
             [taoensso.encore :as enc]
-            [taoensso.timbre :as timbre]
-            [clojure.pprint :as pprint])
+            [taoensso.timbre :as timbre])
   (:import (java.text SimpleDateFormat DateFormat)
            (java.util TimeZone Date)))
 
@@ -111,7 +112,29 @@
     (into base-columns (vec extras))))
 
 
-(defn write-to-disk [{:keys [file]} columns rows]
+(defn unique-path [file date-format first-row-ts]
+  ;; Try to read the first row timestamp as a date and format it, otherwise just
+  ;; use the literal timestamp value.
+  (let [date-str (try
+                   (.format
+                     (SimpleDateFormat. date-format)
+                     (inst/read-instant-date first-row-ts))
+                   (catch Exception _
+                     first-row-ts))
+        path (format file date-str)]
+    (if (.exists (io/file path))
+      (loop [n 1]
+        (let [p (str path "." n)]
+          (if (.exists (io/file p))
+            (recur (inc n))
+            (do
+              (timbre/warn "intended path conflicts with an existing file!")
+              (timbre/warnf "writing to %s instead" p)
+              p))))
+      path)))
+
+
+(defn write-to-disk [{:keys [file date-format]} columns rows]
   (let [columns (all-columns columns rows)
         get-cell (fn [col]
                    (fn [row]
@@ -121,7 +144,8 @@
                          (nil? cell) ""
                          :else (pr-str cell)))))
         get-row (apply juxt (map get-cell columns))
-        path (format file (-> rows first (get "time")))]
+        path (unique-path file date-format (-> rows first (get "time")))]
+    (io/make-parents path)
     (with-open [w (io/writer path)]
       ;; CSV headers
       (.write w (string/join "," columns))

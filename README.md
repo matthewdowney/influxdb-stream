@@ -13,22 +13,23 @@ finely chunked operations which don't cause InfluxDB to self-descruct.
 ```clojure 
 (pull-data
   {;; The InfluxDB database to connect to
-   :host  "127.0.0.1"
-   :port  8086
-   :db    "marketdata"
+   :host          "127.0.0.1"
+   :port          8086
+   :db            "marketdata"
 
 
    ;; Fetch all rows for this measurement, between the start and end dates,
    ;; making queries spanning :interval amounts of time. The :interval is
    ;; important because it imposes a bound on InfluxDB memory usage for a
    ;; single query.
-   :measurement "trade"
-   :start #inst"2020-01-01"
-   :interval [24 :hours]
-   :end #inst"2020-02-01"
+   :measurement   "trade"
+   :start         #inst"2020-01-01"
+   :interval      [24 :hours]
+   :end           #inst"2020-02-01"
 
    ;; Write a certain number of rows per file to a series of files named with
    ;; the given pattern, which accepts the timestamp of the first row.
-   :file "trade.%s.csv"
+   :date-format   "YYYY-MM-dd"
+   :file          "trade.%s.csv"
    :rows-per-file 10000})
 ```
