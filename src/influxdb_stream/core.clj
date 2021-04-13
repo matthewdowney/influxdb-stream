@@ -10,7 +10,8 @@
             [taoensso.encore :as enc]
             [taoensso.timbre :as timbre])
   (:import (java.text SimpleDateFormat DateFormat)
-           (java.util TimeZone Date)))
+           (java.util TimeZone Date)
+           (clojure.lang TransformerIterator RT IteratorSeq)))
 
 
 (def ^:private ^ThreadLocal thread-local-iso-date-format
@@ -30,12 +31,22 @@
     (.format utc-format d)))
 
 
+(defn date-str
+  "If passed a string, returns it as-is, otherwise tries to format a
+  java.util.Date."
+  [d]
+  (if (string? d) d (inst-iso-str d)))
+
+
 (defn >sql
-  "A query for all rows for `measurement` between the `start` and `end` insts."
-  [measurement start end]
-  (format
-    "SELECT * FROM %s WHERE time < '%s' AND time > '%s'"
-    measurement (inst-iso-str end) (inst-iso-str start)))
+  "A query for all rows for `measurement` between the `start` and `end` insts.
+
+  Optionally, pass strings instead of insts."
+  [measurement start end limit]
+  (let [date (fn [x] (if (string? x) x (date-str x)))]
+    (format
+      "SELECT * FROM %s WHERE time < '%s' AND time >= '%s' LIMIT %s"
+      measurement (date end) (date start) limit)))
 
 
 (defn query
@@ -66,22 +77,45 @@
          (partition 2 1))))
 
 
+(defn unchunk [s]
+  (lazy-seq
+    (when-let [x (first (seq s))]
+      (cons x (unchunk (rest s))))))
+
+
 (defn lazy-data-chunks
-  "Create a lazy sequence of parsed `query!` results for data in the intervals."
-  [{:keys [measurement] :as conf} intervals]
-  (map
-    (fn [[start end]]
+  "Create a lazy sequence of parsed `query!` results for data in the intervals.
+
+  If any query fails, the sequence terminates with {::error e :start start}."
+  [{:keys [measurement query-limit] :as conf} intervals]
+  (lazy-seq
+    (when-let [[start end] (first intervals)]
       (try
-        (let [ret (query conf (>sql measurement start end))]
+        (let [ret (query conf (>sql measurement start end query-limit))
+              ;; If the query hit the limit for returned data, try a new
+              ;; interval from end of returned data to end of requested interval
+              next-intervals (if (= (count (:data ret)) query-limit)
+                               (cons
+                                 ;; Same end time, but start time is the last
+                                 ;; data point
+                                 [(-> ret :data peek (get "time"))
+                                  end]
+                                 (rest intervals))
+                               (rest intervals))]
           (timbre/debugf "got %s rows for chunk from %s to %s ..."
                          (count (:data ret))
-                         (inst-iso-str start)
-                         (inst-iso-str end))
-          (query conf (>sql measurement start end)))
+                         (date-str start)
+                         (date-str end))
+          (cons ret (unchunk (lazy-data-chunks conf next-intervals))))
         (catch Exception e
-          (throw
-            (ex-info "Failed to fetch next chunk" {:start start :end end} e)))))
-    intervals))
+          (timbre/error e)
+          {::error e :start start :end end})))))
+
+
+(defn lazy-sequence
+  "Like clojure.core/sequence, except completely lazy (no chunking)."
+  [xform coll]
+  (IteratorSeq/create (TransformerIterator/create xform (RT/iter coll))))
 
 
 (defn stream-data
@@ -93,11 +127,17 @@
                     (lazy-data-chunks conf)
                     ;; Immediately advance the stream until the first chunk with
                     ;; row data.
-                    (drop-while #(empty? (:data %))))
+                    (drop-while #(and (empty? (:data %)) (not (::error %)))))
         cols (-> stream first :columns)
-        stream (sequence
+        stream (lazy-sequence
                  (comp
-                   (mapcat :data)
+                   (mapcat
+                     (fn [chunk]
+                       ;; Leave ::error values intact, otherwise mapcat the
+                       ;; :data
+                       (if (::error chunk)
+                         [chunk]
+                         (:data chunk))))
                    (partition-all rows-per-file))
                  stream)]
     {:columns cols :stream stream}))
@@ -141,7 +181,7 @@
                      (let [cell (get row col)]
                        (cond
                          (number? cell) cell
-                         (nil? cell) ""
+                         (nil? cell) "\"\""
                          :else (pr-str cell)))))
         get-row (apply juxt (map get-cell columns))
         path (unique-path file date-format (-> rows first (get "time")))]
@@ -162,12 +202,19 @@
   (timbre/info "fetching column headers and first data chunk...")
   (let [{:keys [columns stream]} (stream-data conf)]
     (loop [stream stream]
-      (timbre/infof "fetching the next %s rows for writing..." rows-per-file)
       (if-let [nxt (first stream)]
-        (do
-          (write-to-disk conf columns nxt)
+        ;; If there's an error, it's the value which terminates the stream.
+        (let [?err (-> nxt peek ::error)
+              rows-to-write (if ?err (butlast nxt) nxt)]
+
+          (write-to-disk conf columns rows-to-write)
+
+          (when ?err
+            (throw (ex-info "query failed" (dissoc (peek nxt) ::error) ?err)))
+
           (recur (rest stream)))
-        (timbre/info "end of stream reached")))))
+
+        (timbre/info "reached end of data stream")))))
 
 
 (defn pull-data
@@ -184,7 +231,7 @@
         (timbre/error e)
         (when-let [start (-> e ex-data :start)]
           (println "\n***\n")
-          (timbre/debugf "query failed starting at %s" (inst-iso-str start))
+          (timbre/debugf "query failed starting at %s" (date-str start))
           (timbre/info
             (with-out-str
               (println "To retry, picking up from where you left off, try:")

@@ -24,8 +24,9 @@ finely chunked operations which don't cause InfluxDB to self-descruct.
    ;; single query.
    :measurement   "trade"
    :start         #inst"2020-01-01"
-   :interval      [24 :hours]
    :end           #inst"2020-02-01"
+   :interval      [24 :hours]
+   :query-limit   20000 ; max rows returned per query
 
    ;; Write a certain number of rows per file to a series of files named with
    ;; the given pattern, which accepts the timestamp of the first row.
