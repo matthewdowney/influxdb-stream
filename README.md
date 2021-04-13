@@ -6,12 +6,12 @@ or [write](https://github.com/influxdata/influxdb/issues/15433) large amounts of
 data at once. 
 
 This repository contains helpers to split these operations up into "streams" of 
-finely chunked operations which don't cause InfluxDB to self-descruct.
+finely chunked operations which don't cause InfluxDB to self-destruct.
 
 ## Usage
 
 ```clojure 
-(pull-data
+(start
   {;; The InfluxDB database to connect to
    :host          "127.0.0.1"
    :port          8086

@@ -81,33 +81,40 @@
          (partition 2 1))))
 
 
+(def ^:dynamic *interrupted*
+  "A promise which is realized to interrupt data fetching."
+  nil)
+
+
 (defn lazy-data-chunks
   "Create a lazy sequence of parsed `query!` results for data in the intervals.
 
   If any query fails, the sequence terminates with {::error e :start start}."
   [{:keys [query-limit] :as conf} intervals]
   (lazy-seq
-    (when-let [[start end] (first intervals)]
-      (try
-        (let [ret (query conf (>sql conf start end))
-              ;; If the query hit the limit for returned data, try a new
-              ;; interval from end of returned data to end of requested interval
-              next-intervals (if (= (count (:data ret)) query-limit)
-                               (cons
-                                 ;; Same end time, but start time is the last
-                                 ;; data point
-                                 [(-> ret :data peek (get "time"))
-                                  end]
-                                 (rest intervals))
-                               (rest intervals))]
-          (timbre/debugf "got %s rows for chunk from %s to %s ..."
-                         (count (:data ret))
-                         (date-str start)
-                         (date-str end))
-          (cons ret (lazy-data-chunks conf next-intervals)))
-        (catch Exception e
-          (timbre/error e)
-          {::error e :start start :end end})))))
+    (if (and *interrupted* (realized? *interrupted*))
+      (timbre/info "interrupted while fetching data")
+      (when-let [[start end] (first intervals)]
+        (try
+          (let [ret (query conf (>sql conf start end))
+                ;; If the query hit the limit for returned data, try a new
+                ;; interval from end of returned data to end of requested interval
+                next-intervals (if (= (count (:data ret)) query-limit)
+                                 (cons
+                                   ;; Same end time, but start time is the last
+                                   ;; data point
+                                   [(-> ret :data peek (get "time"))
+                                    end]
+                                   (rest intervals))
+                                 (rest intervals))]
+            (timbre/debugf "got %s rows for chunk from %s to %s ..."
+                           (count (:data ret))
+                           (date-str start)
+                           (date-str end))
+            (cons ret (lazy-data-chunks conf next-intervals)))
+          (catch Exception e
+            (timbre/error e)
+            {::error e :start start :end end}))))))
 
 
 (defn lazy-sequence
@@ -200,21 +207,29 @@
     (timbre/debugf "wrote %s rows to %s" (count rows) path)))
 
 
+(defn- await-last-write! [f]
+  (when (and f (not (realized? f)))
+
+    ;; Only debug if it's taking some time to complete the previous write
+    (when (= (deref f 2500 ::timeout) ::timeout)
+      (timbre/debug "awaiting previous write completion..."))
+
+    @f))
+
+
 (defn- fetch-and-write [conf]
   (timbre/info "fetching column headers and first data chunk...")
   (let [{:keys [columns stream]} (stream-data conf)]
+    (timbre/info "got column headers:" columns)
     (loop [stream stream
            last-write-future nil]
       (if-let [nxt (first stream)]
-        ;; If there's an error, it's the value which terminates the stream.
+        ;; If there's an error, it's the value which terminates the stream
         (let [?err (-> nxt peek ::error)
               rows-to-write (if ?err (butlast nxt) nxt)]
 
           ;; If the previous write is still in progress, wait for it to finish
-          (when last-write-future
-            (when-not (realized? last-write-future)
-              (timbre/debug "awaiting previous write completion...")
-              @last-write-future))
+          (await-last-write! last-write-future)
 
           (when ?err
             (throw (ex-info "query failed" (dissoc (peek nxt) ::error) ?err)))
@@ -224,49 +239,93 @@
             ;; Start this write in a new thread
             (future (write-to-disk conf columns rows-to-write))))
 
-        (timbre/info "reached end of data stream")))))
+        (do
+          (await-last-write! last-write-future)
+          (timbre/info "reached end of data stream"))))))
 
 
 (defn pull-data
   "Pull data out of InfluxDB in consecutive intervals, writing data in groups
   of some configurable number of rows to a series of CSV files.
 
+  The `stop-promise`, when realized, interrupts the fetching and writing of
+  data.
+
   See `example-conf` for an example configuration map."
-  [conf]
+  [conf stop-promise]
   (let [?parse-interval #(if (number? %) % (apply enc/ms (reverse %)))
         conf (update conf :interval ?parse-interval)]
-    (try
-      (fetch-and-write conf)
-      (catch Exception e
-        (timbre/error e)
-        (when-let [start (-> e ex-data :start)]
-          (println "\n***\n")
-          (timbre/debugf "query failed starting at %s" (date-str start))
-          (timbre/info
-            (with-out-str
-              (println "To retry, picking up from where you left off, try:")
-              (pprint/pprint
-                (assoc conf :start start)))))))))
+    (binding [*interrupted* stop-promise]
+      (try
+        (fetch-and-write conf)
+        (catch Exception e
+          (timbre/error e)
+          (when-let [start (-> e ex-data :start)]
+            (println "\n***\n")
+            (timbre/debugf "query failed starting at %s" (date-str start))
+            (timbre/info
+              (with-out-str
+                (println "To retry, picking up from where you left off, try:")
+                (pprint/pprint
+                  (assoc conf :start start))))))))))
 
 
 (def example-conf
   "Annotated example configuration."
   {;; The InfluxDB database to connect to
-   :host  "127.0.0.1"
-   :port  8086
-   :db    "marketdata"
+   :host          "127.0.0.1"
+   :port          8086
+   :db            "marketdata"
 
 
    ;; Fetch all rows for this measurement, between the start and end dates,
    ;; making queries spanning :interval amounts of time. The :interval is
    ;; important because it imposes a bound on InfluxDB memory usage for a
-   ;; single query.
-   :measurement "trade"
-   :start #inst"2020-01-01"
-   :interval [24 :hours]
-   :end #inst"2020-02-01"
+   ;; single query. The $timeFilter is replaced with a time range expression
+   ;; according to where in the time range the cursor is, and a LIMIT is
+   ;; appended to the query.
+   :query         "SELECT * FROM trade WHERE $timeFilter"
+   :query-limit   20000 ; max rows returned per query
+   :start         #inst"2020-01-01"
+   :end           #inst"2020-02-01"
+   :interval      [24 :hours]
 
    ;; Write a certain number of rows per file to a series of files named with
    ;; the given pattern, which accepts the timestamp of the first row.
-   :file "rspread.%s.csv"
+   :date-format   "YYYY-MM-dd"
+   :file          "trade.%s.csv"
    :rows-per-file 10000})
+
+
+(defonce state nil)
+
+
+(defn start
+  "Pull data out of InfluxDB in consecutive intervals, writing data in groups
+  of some configurable number of rows to a series of CSV files. Stops when done,
+  or when `stop` is called.
+
+  See `example-conf` for an example configuration map."
+  [conf]
+  (timbre/info
+    (with-out-str
+      (println "Starting up with configuration:")
+      (pprint/pprint conf)))
+
+  (let [stop-promise (promise)
+        state' {:task (future (pull-data conf stop-promise))
+                :stop-promise stop-promise}]
+    (alter-var-root #'state (constantly state'))
+    :ok))
+
+
+(defn stop
+  "Stop the running process, if any."
+  []
+  (if-let [{:keys [task stop-promise]} state]
+    (do
+      (deliver stop-promise true)
+      (timbre/info "stop signal sent, awaiting completion...")
+      @task
+      :ok)
+    (timbre/info "nothing running!")))
