@@ -1,3 +1,4 @@
+;; TODO: Allow modifying the query string directly (e.g. to filter by exchange)
 (ns influxdb-stream.core
   (:require [clojure.string :as string]
             [clojure.set :as set]
@@ -77,12 +78,6 @@
          (partition 2 1))))
 
 
-(defn unchunk [s]
-  (lazy-seq
-    (when-let [x (first (seq s))]
-      (cons x (unchunk (rest s))))))
-
-
 (defn lazy-data-chunks
   "Create a lazy sequence of parsed `query!` results for data in the intervals.
 
@@ -106,7 +101,7 @@
                          (count (:data ret))
                          (date-str start)
                          (date-str end))
-          (cons ret (unchunk (lazy-data-chunks conf next-intervals))))
+          (cons ret (lazy-data-chunks conf next-intervals)))
         (catch Exception e
           (timbre/error e)
           {::error e :start start :end end})))))
