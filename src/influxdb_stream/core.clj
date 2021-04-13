@@ -234,10 +234,9 @@
           (when ?err
             (throw (ex-info "query failed" (dissoc (peek nxt) ::error) ?err)))
 
-          (recur
-            (rest stream)
-            ;; Start this write in a new thread
-            (future (write-to-disk conf columns rows-to-write))))
+          ;; Start this write in a new thread
+          (let [writing (future (write-to-disk conf columns rows-to-write))]
+            (recur (rest stream) writing)))
 
         (do
           (await-last-write! last-write-future)
