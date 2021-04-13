@@ -1,4 +1,3 @@
-;; TODO: Allow modifying the query string directly (e.g. to filter by exchange)
 (ns influxdb-stream.core
   (:require [clojure.string :as string]
             [clojure.set :as set]
@@ -13,6 +12,9 @@
   (:import (java.text SimpleDateFormat DateFormat)
            (java.util TimeZone Date)
            (clojure.lang TransformerIterator RT IteratorSeq)))
+
+
+(set! *warn-on-reflection* true)
 
 
 (def ^:private ^ThreadLocal thread-local-iso-date-format
@@ -43,11 +45,12 @@
   "A query for all rows for `measurement` between the `start` and `end` insts.
 
   Optionally, pass strings instead of insts."
-  [measurement start end limit]
-  (let [date (fn [x] (if (string? x) x (date-str x)))]
-    (format
-      "SELECT * FROM %s WHERE time < '%s' AND time >= '%s' LIMIT %s"
-      measurement (date end) (date start) limit)))
+  [{:keys [query query-limit]} start end]
+  (let [time-filter (format "time < '%s' AND time >= '%s'"
+                            (date-str end) (date-str start))]
+    (str
+      (string/replace query "$timeFilter" time-filter)
+      " LIMIT " query-limit)))
 
 
 (defn query
@@ -82,11 +85,11 @@
   "Create a lazy sequence of parsed `query!` results for data in the intervals.
 
   If any query fails, the sequence terminates with {::error e :start start}."
-  [{:keys [measurement query-limit] :as conf} intervals]
+  [{:keys [query-limit] :as conf} intervals]
   (lazy-seq
     (when-let [[start end] (first intervals)]
       (try
-        (let [ret (query conf (>sql measurement start end query-limit))
+        (let [ret (query conf (>sql conf start end))
               ;; If the query hit the limit for returned data, try a new
               ;; interval from end of returned data to end of requested interval
               next-intervals (if (= (count (:data ret)) query-limit)
@@ -169,6 +172,8 @@
       path)))
 
 
+;; TODO: Do this in its own thread, allow reading ahead one whole file worth of
+;;       rows before blocking to await the previous write
 (defn write-to-disk [{:keys [file date-format]} columns rows]
   (let [columns (all-columns columns rows)
         get-cell (fn [col]
@@ -181,6 +186,7 @@
         get-row (apply juxt (map get-cell columns))
         path (unique-path file date-format (-> rows first (get "time")))]
     (io/make-parents path)
+    (timbre/debugf "writing %s rows to %s" (count rows) path)
     (with-open [w (io/writer path)]
       ;; CSV headers
       (.write w (string/join "," columns))
@@ -190,10 +196,10 @@
       (doseq [r rows]
         (.write w (string/join "," (get-row r)))
         (.write w "\n")))
-    (timbre/debugf "wrote %s rows to %s" (count rows) path)))
+    (timbre/debug "write complete")))
 
 
-(defn- fetch-and-write [{:keys [rows-per-file] :as conf}]
+(defn- fetch-and-write [conf]
   (timbre/info "fetching column headers and first data chunk...")
   (let [{:keys [columns stream]} (stream-data conf)]
     (loop [stream stream]

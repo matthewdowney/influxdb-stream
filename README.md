@@ -21,12 +21,14 @@ finely chunked operations which don't cause InfluxDB to self-descruct.
    ;; Fetch all rows for this measurement, between the start and end dates,
    ;; making queries spanning :interval amounts of time. The :interval is
    ;; important because it imposes a bound on InfluxDB memory usage for a
-   ;; single query.
-   :measurement   "trade"
+   ;; single query. The $timeFilter is replaced with a time range expression
+   ;; according to where in the time range the cursor is, and a LIMIT is
+   ;; appended to the query.
+   :query         "SELECT * FROM trade WHERE $timeFilter"
+   :query-limit   20000 ; max rows returned per query
    :start         #inst"2020-01-01"
    :end           #inst"2020-02-01"
    :interval      [24 :hours]
-   :query-limit   20000 ; max rows returned per query
 
    ;; Write a certain number of rows per file to a series of files named with
    ;; the given pattern, which accepts the timestamp of the first row.
