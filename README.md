@@ -10,15 +10,16 @@ finely chunked operations which don't cause InfluxDB to self-destruct.
 
 ## Usage with a config file
 
-1. Download the tool (alternatively, build it from source with `lein uberjar`).
+1. Create an influxdb-stream/ directory and download the idb.jar tool 
+   (alternatively, build it from source with `lein uberjar`).
    ```
-   $ wget blahblahblah
+   $ mkdir influxdb-stream && wget -O influxdb-stream/idb.jar https://github.com/matthewdowney/influxdb-stream/releases/latest/download/idb-0.1.0.jar
    ```
 
 2. Create a configuration file describing the data to pull and the size of each
    query in the stream in a file called `conf.edn`.
    ```clojure
-   ; conf.edn
+   ; ~/influxdb-stream/conf.edn
    {;; The InfluxDB database to connect to
    :host          "127.0.0.1"
    :port          8086
@@ -54,7 +55,8 @@ finely chunked operations which don't cause InfluxDB to self-destruct.
 3. Run the tool, specifying with `-Xmx` how much RAM is available for use. E.g.
    to run with 10G of RAM allocated:
    ```
-   $ java -Xmx10G -jar influxdb-stream.jar
+   $ cd influxdb-stream
+   $ java -Xmx10G -jar idb.jar
    ```
    
 
