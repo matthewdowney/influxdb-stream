@@ -1,4 +1,5 @@
 (ns influxdb-stream.core
+  (:gen-class)
   (:require [clojure.string :as string]
             [clojure.set :as set]
             [clojure.pprint :as pprint]
@@ -56,6 +57,7 @@
 (defn query
   "Execute the `query-string` and return {:columns [...], :data [{...}]}."
   [{:keys [host port db] :as conf} query-string]
+  (timbre/trace ">" query-string)
   (let [resp (client/post
                (format "http://%s:%s/query" host port)
                {:query-params {:q query-string :db db}})]
@@ -172,10 +174,7 @@
         (let [p (str path "." n)]
           (if (.exists (io/file p))
             (recur (inc n))
-            (do
-              (timbre/warn "intended path conflicts with an existing file!")
-              (timbre/warnf "writing to %s instead" p)
-              p))))
+            p)))
       path)))
 
 
@@ -327,4 +326,44 @@
       (timbre/info "stop signal sent, awaiting completion...")
       @task
       :ok)
-    (timbre/info "nothing running!")))
+    (timbre/info "nothing running")))
+
+
+(defmacro with-shutdown-hook [[hook-name hook-fn] & body]
+  `(let [~hook-name ~hook-fn ;; Make the hook available by name in body
+         hook# (Thread. ~hook-name)
+         rt# (Runtime/getRuntime)]
+     (.addShutdownHook rt# hook#)
+     (let [ret# (do ~@body)]
+       (.removeShutdownHook rt# hook#)
+       ret#)))
+
+
+(defn -main [& args]
+  (let [conf (try
+               (timbre/info "Loading config file...")
+               (let [conf (read-string (slurp "conf.edn"))]
+                 (assert
+                   (contains?
+                     #{:years :months :weeks :days :hours :mins :secs :msecs :ms}
+                     (-> conf :interval second))
+                   "config has valid :interval units")
+                 conf)
+               (catch Exception e
+                 (timbre/error e)
+                 (timbre/error "Error reading configuration file at conf.edn")
+                 (System/exit 1)))]
+
+    ;; Enable granular logging
+    (timbre/merge-config! {:min-level :trace})
+
+    ;; Set a hook to try to exit gracefully on Ctrl+C
+    (with-shutdown-hook [clean-shutdown
+                         (fn []
+                           (stop)
+                           (timbre/info "graceful shutdown complete"))]
+
+      ;; Start fetching & then await task completion
+      (start conf)
+      (-> state :task deref)
+      (shutdown-agents))))

@@ -7,4 +7,6 @@
                  [clj-http "3.9.1"]
                  [com.taoensso/timbre "5.1.0"]]
   :jvm-opts ["-server" "-Xms5G" "-Xmx10G"]
-  :repl-options {:init-ns influxdb-stream.core})
+  :repl-options {:init-ns influxdb-stream.core}
+  :aot :all
+  :main influxdb-stream.core)
