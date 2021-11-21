@@ -51,7 +51,7 @@
                             (date-str end) (date-str start))]
     (str
       (string/replace query "$timeFilter" time-filter)
-      " LIMIT " query-limit)))
+      (when query-limit (str " LIMIT " query-limit)))))
 
 
 (defn query
@@ -242,20 +242,33 @@
           (timbre/info "reached end of data stream"))))))
 
 
-(defn pull-data
-  "Pull data out of InfluxDB in consecutive intervals, writing data in groups
-  of some configurable number of rows to a series of CSV files.
+(defn- do-run-queries [{:keys [start interval end] :as conf}]
+  (loop [intervals (time-intervals start interval end)]
+    ;; Terminate early if interrupted
+    (if (and *interrupted* (realized? *interrupted*))
+      (timbre/info "interrupted while running queries")
 
-  The `stop-promise`, when realized, interrupts the fetching and writing of
-  data.
+      (if-let [[s e] (first intervals)]
+        (let [qstr (>sql conf s e)]
+          (try
+            (let [ret (query conf qstr)
+                  written (get-in ret [:data 0 "written"])]
+              (timbre/debugf
+                "wrote %s for %s ― %s"
+                written (date-str s) (date-str e)))
+            (catch Exception e
+              (timbre/error e)
+              (throw (ex-info "query failed" {:start s :end e}))))
+          (recur (rest intervals)))
+        (timbre/infof "all queries completed")))))
 
-  See `example-conf` for an example configuration map."
-  [conf stop-promise]
+
+(defn execute-query-task [query-task conf stop-promise]
   (let [?parse-interval #(if (number? %) % (apply enc/ms (reverse %)))
         conf (update conf :interval ?parse-interval)]
     (binding [*interrupted* stop-promise]
       (try
-        (fetch-and-write conf)
+        (query-task conf)
         (catch Exception e
           (timbre/error e)
           (when-let [start (-> e ex-data :start)]
@@ -268,7 +281,31 @@
                   (assoc conf :start start))))))))))
 
 
-(def example-conf
+(defonce state nil)
+
+
+(defn read-to-csv
+  "Pull data out of InfluxDB in consecutive intervals, writing data in groups
+  of some configurable number of rows to a series of CSV files. Stops when done,
+  or when `stop` is called.
+
+  See `example-read-to-csv-conf` for an example configuration map."
+  ([conf]
+   (timbre/info
+     (with-out-str
+       (println "Starting up with configuration:")
+       (pprint/pprint conf)))
+
+   (let [stop-promise (promise)
+         state' {:task (future (read-to-csv conf stop-promise))
+                 :stop-promise stop-promise}]
+     (alter-var-root #'state (constantly state'))
+     :ok))
+  ([conf stop-promise]
+   (execute-query-task fetch-and-write conf stop-promise)))
+
+
+(def example-read-to-csv-conf
   "Annotated example configuration."
   {;; The InfluxDB database to connect to
    :host          "127.0.0.1"
@@ -290,31 +327,57 @@
 
    ;; Write a certain number of rows per file to a series of files named with
    ;; the given pattern, which accepts the timestamp of the first row.
-   :date-format   "YYYY-MM-dd"
+   :date-format   "yyyy-MM-dd"
    :file          "trade.%s.csv"
    :rows-per-file 10000})
 
 
-(defonce state nil)
+(defn run-queries
+  "Repeatedly execute the query specified in the conf, replacing $timeFilter
+  first with [start, start+interval], then with [start+interval, start+2interval],
+  and so on.
+
+  See `example-run-queries-conf` for an example configuration map."
+  ([conf]
+   (timbre/info
+     (with-out-str
+       (println "Starting up with configuration:")
+       (pprint/pprint conf)))
+
+   (assert
+     (not (:query-limit conf))
+     ":query-limit option incompatible with run-queries")
+
+   (let [stop-promise (promise)
+         state' {:task (future (run-queries conf stop-promise))
+                 :stop-promise stop-promise}]
+     (alter-var-root #'state (constantly state'))
+     :ok))
+  ([conf stop-promise]
+   (execute-query-task do-run-queries conf stop-promise)))
 
 
-(defn start
-  "Pull data out of InfluxDB in consecutive intervals, writing data in groups
-  of some configurable number of rows to a series of CSV files. Stops when done,
-  or when `stop` is called.
+(def example-run-queries-conf
+  "Annotated example configuration."
+  {;; The InfluxDB database to connect to
+   :host          "127.0.0.1"
+   :port          8086
+   :db            "marketdata"
 
-  See `example-conf` for an example configuration map."
-  [conf]
-  (timbre/info
-    (with-out-str
-      (println "Starting up with configuration:")
-      (pprint/pprint conf)))
+   ;; Execute the query first for the time range [start, start + 60 mins], then
+   ;; for [start + 60 mins, start + 120 mins], and so on.
+   :start         #inst"2020-01-01"
+   :end           #inst"2020-02-01"
+   :interval      [60 :mins]
 
-  (let [stop-promise (promise)
-        state' {:task (future (pull-data conf stop-promise))
-                :stop-promise stop-promise}]
-    (alter-var-root #'state (constantly state'))
-    :ok))
+   ;; Run this query to downsample measurements from "ticker" into
+   ;; the "downsampled-ticker", which takes the last ask and bid values for
+   ;; each minute. The $timeFilter is replaced with a time range expression.
+   :query         "SELECT last(ask) AS \"ask\", last(bid) AS \"bid\"
+                 INTO \"downsampled-ticker\"
+                 FROM \"ticker\"
+                 WHERE $timeFilter
+                 GROUP BY time(1m), \"exchange\", \"market\" fill(none)"})
 
 
 (defn stop
@@ -339,31 +402,57 @@
        ret#)))
 
 
+(defn read-query [query-string]
+  (->> query-string
+       (string/split-lines)
+       (map string/trim)
+       (string/join " ")))
+
+
+(defn read-conf [path]
+  (let [conf (-> (slurp path)
+                 read-string
+                 eval
+                 (update :query read-query))]
+    (assert
+      (contains?
+        #{:years :months :weeks :days :hours :mins :secs :msecs :ms}
+        (-> conf :interval second))
+      "config has valid :interval units")
+    conf))
+
+
 (defn -main [& args]
-  (let [conf (try
+  (when-not (= (count args) 2)
+    (println "Usage: java -jar idb.jar <command> <conf-file>")
+    (println "Examples:")
+    (println "    java -Xmx10G -jar idb.jar read-to-csv read-conf.edn")
+    (println "    java -jar idb.jar run-queries write-conf.edn")
+    (System/exit 1))
+
+  (let [[command conf-file] args
+        conf (try
                (timbre/info "Loading config file...")
-               (let [conf (read-string (slurp "conf.edn"))]
-                 (assert
-                   (contains?
-                     #{:years :months :weeks :days :hours :mins :secs :msecs :ms}
-                     (-> conf :interval second))
-                   "config has valid :interval units")
-                 conf)
+               (read-conf conf-file)
                (catch Exception e
                  (timbre/error e)
-                 (timbre/error "Error reading configuration file at conf.edn")
+                 (timbre/error "Error reading configuration file at" conf-file)
                  (System/exit 1)))]
 
     ;; Enable granular logging
-    (timbre/merge-config! {:min-level :trace})
+    (timbre/merge-config! {:min-level (get conf :log-level :trace)})
 
-    ;; Set a hook to try to exit gracefully on Ctrl+C
-    (with-shutdown-hook [clean-shutdown
-                         (fn []
-                           (stop)
-                           (timbre/info "graceful shutdown complete"))]
+    (let [task (case command
+                 "read-to-csv" read-to-csv
+                 "run-queries" run-queries
+                 (throw (RuntimeException. (str "Invalid command: " command))))]
+      ;; Set a hook to try to exit gracefully on Ctrl+C
+      (with-shutdown-hook [clean-shutdown
+                           (fn []
+                             (stop)
+                             (timbre/info "graceful shutdown complete"))]
 
-      ;; Start fetching & then await task completion
-      (start conf)
-      (-> state :task deref)
-      (shutdown-agents))))
+        ;; Start and then await task completion
+        (task conf)
+        (-> state :task deref)
+        (shutdown-agents)))))
