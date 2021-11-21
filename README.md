@@ -13,7 +13,7 @@ Create an influxdb-stream/ directory and download the idb.jar tool
 (alternatively, build it from source with `lein uberjar`).
 ```
 mkdir influxdb-stream 
-wget -O influxdb-stream/idb.jar https://github.com/matthewdowney/influxdb-stream/releases/latest/download/idb-0.1.0.jar
+wget -O influxdb-stream/idb.jar https://github.com/matthewdowney/influxdb-stream/releases/latest/download/idb.jar
 ```
 
 ## Query data and write to CSV(s)
