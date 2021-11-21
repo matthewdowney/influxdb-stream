@@ -8,15 +8,17 @@ data at once.
 This repository contains helpers to split these operations up into "streams" of 
 finely chunked operations which don't cause InfluxDB to self-destruct.
 
-## Usage with a config file
+## Install
+Create an influxdb-stream/ directory and download the idb.jar tool
+(alternatively, build it from source with `lein uberjar`).
+```
+mkdir influxdb-stream 
+wget -O influxdb-stream/idb.jar https://github.com/matthewdowney/influxdb-stream/releases/latest/download/idb-0.1.0.jar
+```
 
-1. Create an influxdb-stream/ directory and download the idb.jar tool 
-   (alternatively, build it from source with `lein uberjar`).
-   ```
-   $ mkdir influxdb-stream && wget -O influxdb-stream/idb.jar https://github.com/matthewdowney/influxdb-stream/releases/latest/download/idb-0.1.0.jar
-   ```
+## Query data and write to CSV(s)
 
-2. Create a configuration file describing the data to pull and the size of each
+1. Create a configuration file describing the data to pull and the size of each
    query in the stream in a file called `conf.edn`.
    ```clojure
    ; ~/influxdb-stream/conf.edn
@@ -39,7 +41,7 @@ finely chunked operations which don't cause InfluxDB to self-destruct.
 
    ;; Write a certain number of rows per file to a series of files named with
    ;; the given pattern, which accepts the timestamp of the first row.
-   :date-format   "YYYY-MM-dd"
+   :date-format   "yyyy-MM-dd"
    :file          "trade.%s.csv"
    :rows-per-file 10000}
    ```
@@ -52,39 +54,49 @@ finely chunked operations which don't cause InfluxDB to self-destruct.
    `[7 :days]`. 
    
 
-3. Run the tool, specifying with `-Xmx` how much RAM is available for use. E.g.
+2. Run the tool, specifying with `-Xmx` how much RAM is available for use. E.g.
    to run with 10G of RAM allocated:
    ```
    $ cd influxdb-stream
-   $ java -Xmx10G -jar idb.jar
+   $ java -Xmx10G -jar idb.jar read-to-csv conf.edn
    ```
    
+## Write data via repeated queries
 
-## Usage from clojure
+This is useful for e.g. sideloading data from a backup 
+(see [sideloading instructions from influx docs](https://docs.influxdata.com/influxdb/v1.7/administration/backup_and_restore/#restore-examples)
+and GitHub issue for [error which occurs if instructions are followed](https://github.com/influxdata/influxdb/issues/15433))
+or for [downsampling](https://docs.influxdata.com/influxdb/v1.7/guides/downsampling_and_retention/) 
+data.
 
-```clojure 
-(start
-  {;; The InfluxDB database to connect to
+More generally, this is useful anywhere you have a `SELECT ... INTO` query.
+
+1. Create a `conf.edn` file specifying the query and a time range.
+   ```clojure
+   ; ~/influxdb-stream/conf.edn
+   {;; The InfluxDB database to connect to
    :host          "127.0.0.1"
    :port          8086
    :db            "marketdata"
 
-
-   ;; Fetch all rows for this measurement, between the start and end dates,
-   ;; making queries spanning :interval amounts of time. The :interval is
-   ;; important because it imposes a bound on InfluxDB memory usage for a
-   ;; single query. The $timeFilter is replaced with a time range expression
-   ;; according to where in the time range the cursor is, and a LIMIT is
-   ;; appended to the query.
-   :query         "SELECT * FROM trade WHERE $timeFilter"
-   :query-limit   20000 ; max rows returned per query
+   ;; Execute the query first for the time range [start, start + 60 mins], then
+   ;; for [start + 60 mins, start + 120 mins], and so on.
    :start         #inst"2020-01-01"
-   :end           #inst"2020-02-01"
-   :interval      [24 :hours]
+   :end           #inst"2021-01-01"
+   :interval      [60 :mins]
 
-   ;; Write a certain number of rows per file to a series of files named with
-   ;; the given pattern, which accepts the timestamp of the first row.
-   :date-format   "YYYY-MM-dd"
-   :file          "trade.%s.csv"
-   :rows-per-file 10000})
-```
+   ;; Run this query to downsample measurements from "ticker" into
+   ;; the "downsampled-ticker", which takes the last ask and bid values for
+   ;; each minute. The $timeFilter is replaced with a time range expression.
+   :query         "SELECT last(ask) AS \"ask\", last(bid) AS \"bid\"
+                  INTO \"downsampled-ticker\"
+                  FROM \"ticker\"
+                  WHERE $timeFilter
+                  GROUP BY time(1m), \"exchange\", \"market\" fill(none)"}
+   ```
+2. Run the tool. Note here that the JVM doesn't need any special RAM allocation,
+   since the memory-intensive computation happens in Influx.
+   ```
+   cd influxdb-stream
+   java -jar idb.jar run-queries conf.edn
+   ```
