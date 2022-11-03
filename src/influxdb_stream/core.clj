@@ -56,11 +56,14 @@
 
 (defn query
   "Execute the `query-string` and return {:columns [...], :data [{...}]}."
-  [{:keys [host port db] :as conf} query-string]
+  [{:keys [host port db username password] :as conf} query-string]
   (timbre/trace ">" query-string)
-  (let [resp (client/post
+  (let [params (cond-> {:q query-string :db db}
+                       (some? username)
+                       (assoc :u username :p password))
+        resp (client/post
                (format "http://%s:%s/query" host port)
-               {:query-params {:q query-string :db db}})]
+               {:query-params params})]
 
     (when-not (= (:status resp) 200)
       (throw (ex-info "failed" resp)))

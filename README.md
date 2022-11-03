@@ -25,6 +25,8 @@ wget -O influxdb-stream/idb.jar https://github.com/matthewdowney/influxdb-stream
    {;; The InfluxDB database to connect to
    :host          "127.0.0.1"
    :port          8086
+   :username      "optional"
+   :password      "optional"
    :db            "marketdata"
 
    ;; Fetch all rows for this measurement, between the start and end dates,
